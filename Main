@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jul 13 17:38:15 2023
+
+@author: ashraf
+"""
+
+import numpy as np
+import pymc3 as pm
+#import theano.tensor as tt
+import matplotlib.pyplot as plt
+from scipy.stats import gaussian_kde
+
+# Number Of Parameters (For 1 node, 1 neighboring nodes, and 2 neighboring nodes)
+N_P = np.array([2,3,4,10,6,21])
+
+sub_x = np.array([2,3,2,5,3,7])
+sub_y = np.array([1,1,2,2,2,3])
+
+# Number of models :
+N_models = len(N_P)
+
+
+# Set the number of States
+N = 36
+
+# Set the number of sub-states
+NJ = 10
+
+# Set the forcing term
+F = 10.0
+
+# Scaling constants
+h = 1
+b = 10
+c = 10
+
+# Set the initial condition
+x0 = np.random.rand(N, 1); 
+#x0 =  np.ones((N, 1)); 
+y0 = np.dot(np.random.rand(NJ, 1), x0.T)
+#y0 = np.dot(np.ones((NJ, 1)), x0.T)
+x0 = x0[:, 0]
+
+# Set the integration parameters
+dt = 0.001
+t_start = 0.0
+t_end = 5.0
+
+# Create an array to store the time steps
+t_steps = np.arange(t_start, t_end, dt)
+num_steps = len(t_steps)
+
+
+# Training factor 
+T_fact = 2/3
+
+# Trained steps
+num_steps_trained = int(num_steps*T_fact)
+
+# Create arrays to store the solutions
+x_solution = np.zeros((num_steps, N))
+x_solution[0] = x0
+
+y_solution = np.zeros((num_steps, NJ, N))
+y_solution[0] = y0
+
+# Noise parameter
+eta = 0.02
+
+
+def lorenz96_level1(x, y, h, b, c, F):
+    N = len(x)
+    dxdt = np.zeros((N))
+    G = np.sum(y, axis=0)
+    for k in range(N):
+        dxdt[k] = (x[(k + 1) % N] - x[(k - 2) % N]) * x[(k - 1) % N] - x[k] - ((h * c) / b) * G[k] + F
+    return dxdt
+
+def lorenz96_level2(x, y, h, b, c, F):
+    N = len(x)
+    NJ = len(y)
+    dydt = np.zeros((NJ, N))
+    for k in range(N):
+        for j in range(NJ):
+            dydt[j, k] = c * b * y[(j + 1) % NJ, k] * (y[(j - 1) % NJ, k] - y[(j + 2) % NJ, k]) - c * y[j, k] + (
+                        (h * c) / b) * x[k]
+    return dydt
+
+def rk4_xy(x, y, h, b, c, F, dt):
+    k1x = lorenz96_level1(x, y, h, b, c, F)
+    k1y = lorenz96_level2(x, y, h, b, c, F)
+
+    k2x = lorenz96_level1(x + 0.5 * dt * k1x, y + 0.5 * dt * k1y, h, b, c, F)
+    k2y = lorenz96_level2(x + 0.5 * dt * k1x, y + 0.5 * dt * k1y, h, b, c, F)
+
+    k3x = lorenz96_level1(x + 0.5 * dt * k2x, y + 0.5 * dt * k2y, h, b, c, F)
+    k3y = lorenz96_level2(x + 0.5 * dt * k2x, y + 0.5 * dt * k2y, h, b, c, F)
+
+    k4x = lorenz96_level1(x + dt * k3x, y + dt * k3y, h, b, c, F)
+    k4y = lorenz96_level2(x + dt * k3x, y + dt * k3y, h, b, c, F)
+
+    x_new = x + (dt / 6.0) * (k1x + 2 * k2x + 2 * k3x + k4x)
+    y_new = y + (dt / 6.0) * (k1y + 2 * k2y + 2 * k3y + k4y)
+    return x_new, y_new
+
+# Perform the integration
+for n in range(1, num_steps):
+    x_solution[n], y_solution[n] = rk4_xy(x_solution[n - 1], y_solution[n - 1], h, b, c, F, dt)
+
+# Observed state values  (Full Time Steps [0  -->  10 ])
+X_obs = x_solution + eta * np.random.randn(num_steps, N)
+Y_obs = y_solution
+
+#### Trained
+X_trained = x_solution[0:num_steps_trained,:] + eta * np.random.randn(num_steps_trained, N)
+Y_trained = y_solution[0:num_steps_trained,:]
+G_Trained = np.sum(Y_trained, axis=1)
+
+# # Trained RHSs
+# Xdot_Trained = np.zeros((num_steps_trained, N))
+# Ydot_Trained = np.zeros((num_steps_trained, NJ, N))
+
+# for k in range(N):
+#     Xdot_Trained[:, k] = (X_trained[:, (k + 1) % N] - X_trained[:, (k - 2) % N]) * X_trained[:, (k - 1) % N] - X_trained[:, k] - (
+#                 (h * c) / b) * G_Trained[:, k] + F
+#     for j in range(NJ):
+#         Ydot_Trained[:, j, k] = c * b * Y_trained[:, (j + 1) % NJ, k] * (
+#                     Y_trained[:, (j - 1) % NJ, k] - Y_trained[:, (j + 2) % NJ, k]) - c * Y_trained[:, j, k] + (
+#                                       (h * c) / b) * X_trained[:, k]       
+#### Inference with PyMC3 #######
+
+# Initialization for prediction part (Inverse Problem):
+
+# Create arrays to store the solutions
+x_solution_pred = np.zeros((num_steps, N))
+x_solution_pred[0] = x0
+X_Pred = np.zeros((num_steps, N, N_models))
+Error  = np.zeros((num_steps, N, N_models))
+RMSE   = np.zeros((N, N_models))
+PPP    = np.zeros((N_P[-1], N, N_models))     
+for q in range(N_models):
+    
+    # Define the Assumed dynamics:
+    def func(X, d):
+        if q ==0:
+            G_Assumed = d[0] + d[1] * X  # Linear- zero neighboring nodes
+            
+        elif q ==1:
+             G_Assumed = d[0] + d[1] * X + d[2] * X**2   # Quadratic- zero neighboring nodes
+             
+        elif q ==2:
+            G_Assumed = d[0] + d[1] * X[0] + d[2] * X[1] + d[3] * X[2]  # Linear- one neighboring nodes
+            
+        elif q ==3:
+           G_Assumed = d[0] + d[1] * X[0] + d[2] * X[1] + d[3] * X[2] + d[4] * X[0]**2 + d[5] * X[1]**2 + d[6] * X[2]**2 \
+                     + d[7] * X[0] * X[1] + d[8] * X[0] * X[2] + d[9] * X[1] * X[2]  # Quadratic- one neighboring nodes
+                       
+        elif q ==4:
+          G_Assumed = d[0] + d[1] * X[0] + d[2] * X[1] + d[3] * X[2] + d[4] * X[3] + d[5] * X[4] # Linear- two neighboring nodes
+          
+        elif q ==5:
+           G_Assumed = d[0] + d[1] * X[0] + d[2] * X[1] + d[3] * X[2] + d[4] * X[3] + d[5] * X[4] \
+                       + d[6] * X[0] * X[1] + d[7] * X[0] * X[2] + d[8] * X[0] * X[3] + d[9] * X[0] * X[4] \
+                       + d[10] * X[1] * X[2] + d[11] * X[1] * X[3] + d[12] * X[1] * X[4] \
+                       + d[13] * X[2] * X[3] + d[14] * X[2] * X[4] \
+                       + d[15] * X[3] * X[4] \
+                       + d[16] * X[0] ** 2 + d[17] * X[1] ** 2 + d[18] * X[2] ** 2 + d[19] * X[3] ** 2 + d[20] * X[4] ** 2  # Quadratic- two neighboring nodes
+        return G_Assumed
+
+
+     #####  Define the model ######
+    # Initializations:
+    d_mean = np.zeros((N_P[q],N))
+
+    for k in range(N):
+        
+        with pm.Model() as model:
+            
+            # Priors
+            d = pm.Normal("d", mu=0, sigma=10, shape=N_P[q])
+            
+            # X vector:
+            if q == 0 or q == 1:
+                X = X_trained[:,k]
+            
+                
+            elif q == 2 or q == 3:
+                X = (X_trained[:,(k-1)%N], X_trained[:,k], X_trained[:,(k+1)%N])
+                
+                
+            elif q == 4 or q == 5:
+                X = (X_trained[:,(k-2)%N], X_trained[:,(k-1)%N], X_trained[:,k], X_trained[:,(k+1)%N], X_trained[:,(k+2)%N])
+                
+            
+            # Calling "func" to calculate G_assumed 
+            G_Assumed = func(X, d)
+            
+            
+            # Likelihood
+            likelihood = pm.Normal("likelihood", mu=G_Assumed, sigma=1, observed=G_Trained[:,k])
+            
+            # Sampling
+            trace = pm.sample(3000, tune=1000)
+            
+            # Parameters
+            params = trace["d"]
+            
+            # Parameters means with print
+            #print("Parameter Means:")
+            for j in range(N_P[q]):
+                d_mean[j,k] = np.mean(params[:, j])
+                #print(f"d{j}: {d_mean[j,k]}")
+            PPP[:,k,q] = np.concatenate(( d_mean[:,k], np.zeros((N_P[-1]- len(d_mean[:,k]) )) ))
+            
+            # Plot parameter distributions
+            fig, axes = plt.subplots(sub_x[q], sub_y[q], figsize=(12, 18), dpi=300)
+            for i, ax in enumerate(axes.flatten()):
+                param_samples = params[:, i]
+                lower = np.percentile(param_samples, 2.5)
+                upper = np.percentile(param_samples, 97.5)
+                x = np.linspace(lower, upper, 100)
+                kde = gaussian_kde(param_samples)
+                ax.plot(x, kde(x))
+                ax.fill_between(x, kde(x), where=(x >= lower) & (x <= upper), alpha=0.3)
+                ax.set_xlabel(f"d{i}")
+                ax.set_ylabel("Density")
+                ax.axvline(np.mean(param_samples), color='g', linestyle='--')  # Vertical line for mean
+                ax.text(
+                    0.4, 0.5, f"Mean: {np.mean(param_samples):.2f}", transform=ax.transAxes, ha='right', va='bottom', fontsize=13.5
+                )  # Text for mean
+                ax.text(
+                    0.52, 0.2, f"CI: [{lower:.2f}, {upper:.2f}]", transform=ax.transAxes, ha='left', va='top', fontsize=13.5
+                )  # Text for credibility interval
+                ax.grid(True)
+            plt.tight_layout()
+
+
+    # Inverse Problem ( prediction ):
+    def lorenz96_Pred(x_p, d_mean, h, b, c, F):
+        N = len(x_p)
+        dxdt_pred = np.zeros((N))
+        for k in range(N):
+            
+            # X_p vector:
+            if q == 0 or q == 1:
+                X_p = x_p[k]
+
+            elif q == 2 or q == 3:
+                X_p = (x_p[(k-1)%N], x_p[k], x_p[(k+1)%N])
+                
+            elif q == 4 or q == 5:
+                X_p = (x_p[(k-2)%N], x_p[(k-1)%N], x_p[k], x_p[(k+1)%N], x_p[(k+2)%N])
+                
+            G_pred = func(X_p, d_mean[:,k]) # Predicted G term
+            
+            dxdt_pred[k] = (x_p[(k + 1) % N] - x_p[(k - 2) % N]) * x_p[(k - 1) % N] - x_p[k] - ((h * c) / b) * G_pred + F
+        return dxdt_pred
+    
+    def rk4_pred(x_p, d_mean, h, b, c, F, dt):
+        k1 = lorenz96_Pred(x_p, d_mean, h, b, c, F)
+        k2 = lorenz96_Pred(x_p + 0.5 * dt * k1, d_mean, h, b, c, F)
+        k3 = lorenz96_Pred(x_p + 0.5 * dt * k2, d_mean, h, b, c, F)
+        k4 = lorenz96_Pred(x_p + dt * k3, d_mean, h, b, c, F)
+        x_new_p = x_p + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+        return x_new_p
+   
+    # Perform the integration (Prediction)
+    for n in range(1, num_steps): 
+        x_solution_pred[n] = rk4_pred(x_solution_pred[n - 1], d_mean, h, b, c, F, dt)
+    
+    X_Pred[:,:,q] = x_solution_pred
+
+
+# Error :
+for q in range(N_models):
+    for k in range(N):
+        Error[:,k,q] = np.sqrt((X_Pred[:,k,q] - X_obs[:,k]) ** 2)
+        RMSE[k,q] = np.mean(np.sqrt((X_Pred[:,k,q] - X_obs[:,k]) ** 2))
+
+# plots
+# Predicted vs Observed
+for q in range(N_models):
+    
+    fig, axes = plt.subplots(6, 6, figsize=(18,18), dpi=300)
+    for k, ax in enumerate(axes.flatten()):
+        ax.plot(t_steps, X_Pred[:,k,q], label='X_{Predicted}')
+        ax.plot(t_steps, X_obs[:, k], '--', label='X_{Observed}')
+        ax.set_xlabel("Time")
+        ax.set_ylabel("X")
+        ax.legend()
+        ax.grid(True)   
+    plt.tight_layout()
+    plt.savefig('Observed_vs_Predicted_X.png', dpi=300)
+    plt.show()
+
+
+# Error    
+fig, axes = plt.subplots(6, 6, figsize=(18,18), dpi=300)
+for k, ax in enumerate(axes.flatten()):
+    ax.plot(t_steps, Error[:,k,0], label='Model (1)')
+    ax.plot(t_steps, Error[:,k,1], label='Model (2)')
+    ax.plot(t_steps, Error[:,k,2], label='Model (3)')
+    ax.plot(t_steps, Error[:,k,3], label='Model (4)')
+    ax.plot(t_steps, Error[:,k,4], label='Model (5)')
+    ax.plot(t_steps, Error[:,k,5], label='Model (6)')
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Error in X")
+    ax.legend()
+    ax.grid(True)
+plt.tight_layout()
+plt.savefig('Error_in_X.png', dpi=300)
+plt.show() 
+
+# RMSE:
+n_stat = np.linspace(1,36,36)
+plt.figure(figsize=(10, 6))
+plt.plot(n_stat,  RMSE[:,0], label='Model (1)')
+plt.plot(n_stat,  RMSE[:,1], label='Model (2)')
+plt.plot(n_stat,  RMSE[:,2], label='Model (3)')
+plt.plot(n_stat,  RMSE[:,3], label='Model (4)')
+plt.plot(n_stat,  RMSE[:,4], label='Model (5)')
+plt.plot(n_stat,  RMSE[:,5], label='Model (6)')
+
+plt.xlabel(' State No.')
+plt.ylabel('RMSE')
+plt.legend()
+plt.grid(True)
+plt.savefig('RMSE.png', dpi=300)
+plt.show()
+
+# Mean in states:
+RMMSE_1 = np.mean(RMSE[:,0]);  print(RMMSE_1)
+RMMSE_2 = np.mean(RMSE[:,1]);  print(RMMSE_2)
+RMMSE_3 = np.mean(RMSE[:,2]);  print(RMMSE_3)
+RMMSE_4 = np.mean(RMSE[:,3]);  print(RMMSE_4)
+RMMSE_5 = np.mean(RMSE[:,4]);  print(RMMSE_5)
+RMMSE_6 = np.mean(RMSE[:,5]);  print(RMMSE_6)
+ 
+Min_RMMSE = min([RMMSE_1,RMMSE_2,RMMSE_3,RMMSE_4,RMMSE_5,RMMSE_6]); print(Min_RMMSE)
